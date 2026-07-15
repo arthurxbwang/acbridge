@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -358,6 +359,12 @@ func handleDeleteCert(w http.ResponseWriter, r *http.Request) {
 
 // parsing and helper functions
 
+func getCertID(crtPEM string) int64 {
+	h := fnv.New64a()
+	h.Write([]byte(crtPEM))
+	return int64(h.Sum64() & 0x7FFFFFFFFFFFFFFF) // Positive 64-bit int
+}
+
 func parsePEMCert(crtPEM string) ([]string, time.Time, string, error) {
 	block, _ := pem.Decode([]byte(crtPEM))
 	if block == nil {
@@ -550,6 +557,14 @@ func certListsMatch(listA, listB []CaddyLoadPemItem) bool {
 	return true
 }
 
+func normalizePEM(pemStr string) string {
+	s := strings.ReplaceAll(pemStr, "\r", "")
+	s = strings.ReplaceAll(s, "\n", "")
+	s = strings.ReplaceAll(s, " ", "")
+	s = strings.ReplaceAll(s, "\t", "")
+	return s
+}
+
 func getCaddyPEMCerts() ([]CaddyLoadPemItem, error) {
 	resp, code, err := caddyRequest(http.MethodGet, "/config/apps/tls/certificates/load_pem", nil)
 	if err != nil {
@@ -615,4 +630,37 @@ func initializeCaddyCerts(certs []CaddyLoadPemItem) error {
 	}
 
 	return fmt.Errorf("failed to sync with Caddy, last API code: %d, error: %v", code, err)
+}
+
+func caddyRequest(method, path string, body interface{}) ([]byte, int, error) {
+	url := fmt.Sprintf("%s%s", caddyURL, path)
+	var bodyReader io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return nil, 0, err
+		}
+		bodyReader = strings.NewReader(string(b))
+	}
+
+	req, err := http.NewRequest(method, url, bodyReader)
+	if err != nil {
+		return nil, 0, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return respBody, resp.StatusCode, err
+	}
+
+	return respBody, resp.StatusCode, nil
 }
