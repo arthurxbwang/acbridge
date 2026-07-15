@@ -23,24 +23,24 @@ fi
 # 1. 交互式配置输入
 
 # 1.1 安装位置
-read -p "请输入安装目录 [默认: /opt/acbridge]: " INSTALL_DIR
+read -p "请输入安装目录 [默认: /opt/acbridge]: " INSTALL_DIR < /dev/tty
 INSTALL_DIR=${INSTALL_DIR:-/opt/acbridge}
 
 # 1.2 服务运行端口
-read -p "请输入 acbridge 监听端口 [默认: 9443]: " PORT
+read -p "请输入 acbridge 监听端口 [默认: 9443]: " PORT < /dev/tty
 PORT=${PORT:-9443}
 
 # 1.3 Caddy Admin API 地址
-read -p "请输入 Caddy Admin API 地址 [默认: http://127.0.0.1:2019]: " CADDY_URL
+read -p "请输入 Caddy Admin API 地址 [默认: http://127.0.0.1:2019]: " CADDY_URL < /dev/tty
 CADDY_URL=${CADDY_URL:-http://127.0.0.1:2019}
 
 # 1.4 API Token
 DEFAULT_TOKEN=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)
-read -p "请输入 API 验证 Token (回车将随机生成) [默认: $DEFAULT_TOKEN]: " TOKEN
+read -p "请输入 API 验证 Token (回车将随机生成) [默认: $DEFAULT_TOKEN]: " TOKEN < /dev/tty
 TOKEN=${TOKEN:-$DEFAULT_TOKEN}
 
 # 1.5 同步频率
-read -p "请输入与 Caddy 的同步检查频率 (秒) [默认: 30]: " SYNC_INTERVAL
+read -p "请输入与 Caddy 的同步检查频率 (秒) [默认: 30]: " SYNC_INTERVAL < /dev/tty
 SYNC_INTERVAL=${SYNC_INTERVAL:-30}
 
 echo -e "\n${YELLOW}=== 确认安装配置 ===${PLAIN}"
@@ -50,7 +50,7 @@ echo -e "Caddy API: ${GREEN}${CADDY_URL}${PLAIN}"
 echo -e "安全 Token: ${GREEN}${TOKEN}${PLAIN}"
 echo -e "同步频率: ${GREEN}${SYNC_INTERVAL} 秒${PLAIN}"
 echo -e "${YELLOW}====================${PLAIN}"
-read -p "确认无误？按回车键继续，按 Ctrl+C 退出..."
+read -p "确认无误？按回车键继续，按 Ctrl+C 退出..." < /dev/tty
 
 # 2. 检查与安装系统依赖
 echo -e "\n${BLUE}[1/5] 检查系统依赖...${PLAIN}"
