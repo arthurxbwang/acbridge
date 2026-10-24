@@ -7,7 +7,8 @@ Wants=caddy.service
 Type=simple
 User=root
 WorkingDirectory=/opt/acbridge
-ExecStart=/opt/acbridge/acbridge -addr :9443 -token YOUR_SECRET_TOKEN -caddy http://127.0.0.1:2019 -cert-dir /var/lib/acbridge/certs -sync-interval 30
+EnvironmentFile=/opt/acbridge/acbridge.env
+ExecStart=/opt/acbridge/acbridge -addr :9443 -caddy http://127.0.0.1:2019 -cert-dir /var/lib/acbridge/certs -sync-interval 30
 Restart=always
 RestartSec=5
 

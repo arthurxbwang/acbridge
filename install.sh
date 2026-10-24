@@ -36,7 +36,8 @@ CADDY_URL=${CADDY_URL:-http://127.0.0.1:2019}
 
 # 1.4 API Token
 DEFAULT_TOKEN=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)
-read -p "请输入 API 验证 Token (回车将随机生成) [默认: $DEFAULT_TOKEN]: " TOKEN < /dev/tty
+read -r -s -p "请输入 API 验证 Token (回车将随机生成，输入不回显): " TOKEN < /dev/tty
+echo
 TOKEN=${TOKEN:-$DEFAULT_TOKEN}
 
 # 1.5 同步频率
@@ -47,7 +48,7 @@ echo -e "\n${YELLOW}=== 确认安装配置 ===${PLAIN}"
 echo -e "安装目录: ${GREEN}${INSTALL_DIR}${PLAIN}"
 echo -e "服务端口: ${GREEN}${PORT}${PLAIN}"
 echo -e "Caddy API: ${GREEN}${CADDY_URL}${PLAIN}"
-echo -e "安全 Token: ${GREEN}${TOKEN}${PLAIN}"
+echo -e "安全 Token: 已配置（不显示）"
 echo -e "同步频率: ${GREEN}${SYNC_INTERVAL} 秒${PLAIN}"
 echo -e "${YELLOW}====================${PLAIN}"
 read -p "确认无误？按回车键继续，按 Ctrl+C 退出..." < /dev/tty
@@ -141,6 +142,11 @@ echo -e "二进制已成功安装至: ${GREEN}$INSTALL_DIR/acbridge${PLAIN}"
 echo -e "\n${BLUE}[4/5] 配置 Systemd 服务...${PLAIN}"
 
 SERVICE_FILE="/etc/systemd/system/acbridge.service"
+# Keep credentials out of argv, service status and installer output.
+TOKEN_ESCAPED=${TOKEN//\\/\\\\}
+TOKEN_ESCAPED=${TOKEN_ESCAPED//\"/\\\"}
+(umask 077; printf 'ACBRIDGE_TOKEN="%s"\n' "$TOKEN_ESCAPED" > "$INSTALL_DIR/acbridge.env")
+chmod 600 "$INSTALL_DIR/acbridge.env"
 
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -152,7 +158,8 @@ Wants=caddy.service
 Type=simple
 User=root
 WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/acbridge -addr :$PORT -token $TOKEN -caddy $CADDY_URL -cert-dir /var/lib/acbridge/certs -sync-interval $SYNC_INTERVAL
+EnvironmentFile=$INSTALL_DIR/acbridge.env
+ExecStart=$INSTALL_DIR/acbridge -addr :$PORT -caddy $CADDY_URL -cert-dir /var/lib/acbridge/certs -sync-interval $SYNC_INTERVAL
 Restart=always
 RestartSec=5
 
@@ -178,7 +185,7 @@ if systemctl is-active --quiet acbridge; then
     echo -e "${GREEN}🎉 acbridge 安装及启动成功！${PLAIN}"
     echo -e "=================================================="
     echo -e "1. 接口地址   : ${BLUE}https://<服务器IP>:$PORT${PLAIN}"
-    echo -e "2. 验证 Token : ${GREEN}$TOKEN${PLAIN}"
+    echo -e "2. 验证 Token : 已保存于安装目录的 acbridge.env（权限 0600，不显示）"
     echo -e "3. 证书备份目录: ${BLUE}/var/lib/acbridge/certs${PLAIN}"
     echo -e "4. Caddy API  : ${BLUE}$CADDY_URL${PLAIN}"
     echo -e "5. 运行状态   : ${GREEN}运行中 (Active)${PLAIN}"
@@ -186,7 +193,7 @@ if systemctl is-active --quiet acbridge; then
     echo -e "【AllinSSL 配置提示】"
     echo -e "请在 AllinSSL 的“授权 API”中添加 “雷池 (SafeLine)” WAF 实例："
     echo -e "  - 访问地址: https://<服务器IP>:$PORT"
-    echo -e "  - API Token: $TOKEN"
+    echo -e "  - API Token: 使用安装时配置的值；随机生成的值保存在 acbridge.env，请安全读取"
     echo -e "--------------------------------------------------"
     echo -e "【管理命令】"
     echo -e "  - 查看服务状态: ${YELLOW}systemctl status acbridge${PLAIN}"
