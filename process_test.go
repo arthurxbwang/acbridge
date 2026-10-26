@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -55,6 +56,32 @@ func TestProcessLifecycle(t *testing.T) {
 			}
 		})
 	}
+	t.Run("occupied-port-does-not-change-state", func(t *testing.T) {
+		setup(t)
+		admin := fakeCaddy(t, map[string]interface{}{})
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		dir := filepath.Join(t.TempDir(), "new-cache")
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, bin, "-http", "-addr", listener.Addr().String(), "-caddy", caddyURL, "-cert-dir", dir)
+		cmd.Env = append(append([]string{}, cleanEnv...), "ACBRIDGE_TOKEN=process-test-token")
+		if err := cmd.Run(); err == nil || ctx.Err() != nil {
+			t.Fatal("occupied port must fail promptly")
+		}
+		admin.mu.Lock()
+		writes := admin.writes
+		admin.mu.Unlock()
+		if writes != 0 {
+			t.Fatal("failed startup changed Caddy configuration")
+		}
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Fatal("failed startup created cache directory")
+		}
+	})
 	start := func(t *testing.T, args ...string) func() {
 		t.Helper()
 		cmd := exec.Command(bin, args...)

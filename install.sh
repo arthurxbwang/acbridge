@@ -118,6 +118,7 @@ validate() {
     else
         [[ -r $TLS_CERT && -r $TLS_KEY && $TLS_SERVER_NAME =~ ^[a-zA-Z0-9.-]+$ ]] || { fail 'TLS mode needs readable --tls-cert/--tls-key and --tls-server-name'; return 1; }
     fi
+    [[ $TLS_CA != *$'\n'* && $TLS_CA != *$'\r'* ]] || { fail 'TLS CA path cannot contain line breaks'; return 1; }
     [[ -z $TLS_CA || -r $TLS_CA ]] || { fail 'Cannot read TLS CA bundle'; return 1; }
     PORT=$((10#$PORT)); SYNC_INTERVAL=$((10#$SYNC_INTERVAL))
     [[ $REF =~ ^[a-zA-Z0-9_./-]+$ && $REF != -* ]] || { fail 'Invalid Git ref'; return 1; }
@@ -138,6 +139,18 @@ if cache_dir.exists():
         if p.is_symlink() or not p.is_file() or not (p.name=='.acbridge-cache.json' or p.name.startswith('.cache-') or p.suffix in ('.pem','.crt','.key')):
             raise SystemExit('Existing certificate directory contains unrelated entries; choose a dedicated cache directory')
 PY
+}
+# These paths are hidden by the generated systemd sandbox. Resolve parent
+# symlinks as well so an apparently safe path cannot point into a hidden tree.
+validate_service_paths() {
+    python3 - "$INSTALL_DIR" "$CERT_DIR" <<'PY_PATHS'
+import pathlib,sys
+hidden=[pathlib.Path(p) for p in ('/home','/root','/run/user','/tmp','/var/tmp')]
+for label,value in zip(('Installation directory','Certificate cache'),sys.argv[1:]):
+    path=pathlib.Path(value).resolve()
+    if any(path==base or base in path.parents for base in hidden):
+        raise SystemExit(label+' is hidden by the systemd sandbox; use dedicated directories such as /opt/acbridge and /var/lib/acbridge/certs')
+PY_PATHS
 }
 preflight() {
     [[ $EUID == 0 ]] || { fail 'Run this installer as root'; return 1; }
@@ -356,6 +369,7 @@ main() {
     parse_args "$@"
     prompt_settings
     validate
+    validate_service_paths
     TMP=$(mktemp -d /tmp/acbridge-install.XXXXXX)
     trap cleanup EXIT
     preflight

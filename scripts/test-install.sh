@@ -77,6 +77,24 @@ case "$1" in
         mkdir -p "$CERT_DIR"; printf 'unrelated' > "$CERT_DIR/database.sqlite"
         if validate 2>/dev/null; then exit 1; fi
         ;;
+    service_paths)
+        INSTALL_DIR=/opt/acbridge CERT_DIR=/var/lib/acbridge/certs
+        validate_service_paths
+        for hidden in /home/user/acbridge /root/acbridge /run/user/1000/acbridge /tmp/acbridge /var/tmp/acbridge; do
+            INSTALL_DIR=$hidden CERT_DIR=/var/lib/acbridge/certs
+            if validate_service_paths 2>/dev/null; then exit 1; fi
+            INSTALL_DIR=/opt/acbridge CERT_DIR=$hidden
+            if validate_service_paths 2>/dev/null; then exit 1; fi
+        done
+        ln -s /home/user "$fixture/hidden-parent"
+        INSTALL_DIR=$fixture/hidden-parent/acbridge CERT_DIR=/var/lib/acbridge/certs
+        if validate_service_paths 2>/dev/null; then exit 1; fi
+        ;;
+    ca_path_linebreak)
+        TLS_CA="$fixture/ca"$'\n''MODE=tls'
+        touch "$TLS_CA"
+        if validate 2>/dev/null; then exit 1; fi
+        ;;
     public_http)
         BIND=0.0.0.0
         if validate 2>/dev/null; then exit 1; fi
@@ -123,7 +141,7 @@ esac
 rm -rf "$fixture"
 DRIVER
 # The child shell owns errexit. Do not wrap its body in an if/function that disables it.
-for scenario in preserve rotate rollback malicious_config invalid_port unsafe_cache unrelated_cache public_http legacy legacy_token localhost readiness unready; do
+for scenario in preserve rotate rollback malicious_config invalid_port unsafe_cache unrelated_cache service_paths ca_path_linebreak public_http legacy legacy_token localhost readiness unready; do
     bash "$test_dir/scenario.sh" "$scenario" > "$test_dir/output" 2>&1 || { cat "$test_dir/output"; printf 'FAIL %s\n' "$scenario"; exit 1; }
     printf 'PASS installer %s\n' "$scenario"
 done

@@ -384,6 +384,12 @@ func TestRealCaddyTLS(t *testing.T) {
 	setup(t)
 	admin, https := unusedAddress(t), unusedAddress(t)
 	conf := map[string]interface{}{"admin": map[string]interface{}{"listen": admin}, "apps": map[string]interface{}{"http": map[string]interface{}{"servers": map[string]interface{}{"test": map[string]interface{}{"listen": []string{https}, "automatic_https": map[string]interface{}{"disable": true}, "tls_connection_policies": []interface{}{map[string]interface{}{}}, "routes": []interface{}{map[string]interface{}{"handle": []interface{}{map[string]interface{}{"handler": "static_response", "body": "preserved route"}}}}}}}, "tls": map[string]interface{}{"certificates": map[string]interface{}{"load_pem": []interface{}{}, "load_files": []interface{}{}}, "automation": map[string]interface{}{"policies": []interface{}{map[string]interface{}{"subjects": []string{"unused.test"}, "issuers": []interface{}{map[string]interface{}{"module": "internal"}}}}}}}}
+	// Test PKI must never attempt to modify the machine's trust store.
+	conf["apps"].(map[string]interface{})["pki"] = map[string]interface{}{
+		"certificate_authorities": map[string]interface{}{
+			"local": map[string]interface{}{"install_trust": false},
+		},
+	}
 	file := filepath.Join(t.TempDir(), "caddy.json")
 	data, _ := json.Marshal(conf)
 	if e := os.WriteFile(file, data, 0600); e != nil {
@@ -403,7 +409,12 @@ func TestRealCaddyTLS(t *testing.T) {
 	}
 	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
 	caddyURL = "http://" + admin
-	httpClient = &http.Client{Timeout: 3 * time.Second}
+	// /load replaces Caddy's Admin server and asynchronously closes its old
+	// connections. Do not reuse an idle connection for the next non-idempotent
+	// fixture POST: net/http cannot safely retry that request after a reset.
+	transport := &http.Transport{DisableKeepAlives: true}
+	t.Cleanup(transport.CloseIdleConnections)
+	httpClient = &http.Client{Timeout: 3 * time.Second, Transport: transport}
 	ready := false
 	for i := 0; i < 100; i++ {
 		_, s, _, err := caddyCall("GET", "/config/", nil, "")
@@ -426,7 +437,7 @@ func TestRealCaddyTLS(t *testing.T) {
 		}
 		_, status, _, err := caddyCall("POST", "/load", minimal, "")
 		if err != nil || status != 200 {
-			t.Fatal("cannot load initialization fixture")
+			t.Fatalf("cannot load initialization fixture: HTTP %d, error %v", status, err)
 		}
 		requireStatus(t, request(t, h, "POST", "/api/open/cert", upload(a), token), 200)
 	}

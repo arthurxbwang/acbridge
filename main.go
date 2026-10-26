@@ -116,6 +116,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Reserve the address before touching the cache or Caddy. A second process
+	// must not synchronize an empty cache and only then discover a port conflict.
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen: %w", err)
+	}
+	defer listener.Close()
 	if err := os.MkdirAll(certDir, 0700); err != nil {
 		return fmt.Errorf("create certificate cache: %w", err)
 	}
@@ -128,7 +135,7 @@ func run() error {
 	go startSyncLoop()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return serveRuntime(ctx, server, options.HTTP)
+	return serveRuntimeListener(ctx, server, listener, options.HTTP)
 }
 
 // authMiddleware checks the X-SLCE-API-TOKEN header

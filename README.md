@@ -24,6 +24,8 @@ sudo bash install.sh --ref feat/deployment-hardening
 
 安装器默认使用 `127.0.0.1:9443` 的 HTTP 代理模式，以独立 `acbridge` 用户运行。首次生成随机 Token；升级沿用已有 Token、端口、Caddy 地址和缓存目录。需要无人值守时加 `--yes`；所有选项见 `bash install.sh --help`。实际 Token 保存在安装目录的 `acbridge.env` 中，权限 `0600`，请通过安全渠道填写至 AllinSSL。明确加 `--rotate-token` 才会轮换 Token，并需同步更新 AllinSSL。
 
+安装目录和证书缓存目录应使用 `/opt/acbridge`、`/var/lib/acbridge/certs` 等专用路径；systemd 沙箱隐藏 `/home`、`/root`、`/run/user`、`/tmp`、`/var/tmp`，安装器会拒绝这些目录及解析符号链接后落入其中的路径。
+
 安装器验证 Caddy Admin API 和带鉴权的 `/readyz`，服务启动或就绪检查失败会回滚程序及配置并返回非零状态。证书缓存不会作为程序回滚的一部分被覆盖。旧版端口、Token 和缓存目录可以迁移，但原自签 HTTPS 入口需要明确选择 `--mode proxy` 或提供可信证书的 `--mode tls`，不会静默切换传输方式。首次迁移须同步核对 AllinSSL 中的 HTTPS 地址。
 
 为桥接入口配置独立域名，例如在已有 Caddyfile 中添加：
