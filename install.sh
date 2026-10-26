@@ -1,206 +1,366 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Install or upgrade acbridge without discarding existing configuration.
+set -Eeuo pipefail
+umask 077
 
-# acbridge - 一键安装与更新脚本
-# 适用系统: Debian, Ubuntu, CentOS, RHEL, Rocky Linux 等
-
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-PLAIN='\033[0m'
-
-echo -e "${BLUE}==================================================${PLAIN}"
-echo -e "${GREEN}      acbridge (AllinSSL Caddy Bridge) 安装脚本      ${PLAIN}"
-echo -e "${BLUE}==================================================${PLAIN}"
-
-# 必须以 root 权限运行
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}错误：必须以 root 权限运行此脚本。请使用 sudo 或切换至 root 用户。${PLAIN}"
-    exit 1
-fi
-
-# 1. 交互式配置输入
-
-# 1.1 安装位置
-read -p "请输入安装目录 [默认: /opt/acbridge]: " INSTALL_DIR < /dev/tty
-INSTALL_DIR=${INSTALL_DIR:-/opt/acbridge}
-
-# 1.2 服务运行端口
-read -p "请输入 acbridge 监听端口 [默认: 9443]: " PORT < /dev/tty
-PORT=${PORT:-9443}
-
-# 1.3 Caddy Admin API 地址
-read -p "请输入 Caddy Admin API 地址 [默认: http://127.0.0.1:2019]: " CADDY_URL < /dev/tty
-CADDY_URL=${CADDY_URL:-http://127.0.0.1:2019}
-
-# 1.4 API Token
-DEFAULT_TOKEN=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1)
-read -r -s -p "请输入 API 验证 Token (回车将随机生成，输入不回显): " TOKEN < /dev/tty
-echo
-TOKEN=${TOKEN:-$DEFAULT_TOKEN}
-
-# 1.5 同步频率
-read -p "请输入与 Caddy 的同步检查频率 (秒) [默认: 30]: " SYNC_INTERVAL < /dev/tty
-SYNC_INTERVAL=${SYNC_INTERVAL:-30}
-
-echo -e "\n${YELLOW}=== 确认安装配置 ===${PLAIN}"
-echo -e "安装目录: ${GREEN}${INSTALL_DIR}${PLAIN}"
-echo -e "服务端口: ${GREEN}${PORT}${PLAIN}"
-echo -e "Caddy API: ${GREEN}${CADDY_URL}${PLAIN}"
-echo -e "安全 Token: 已配置（不显示）"
-echo -e "同步频率: ${GREEN}${SYNC_INTERVAL} 秒${PLAIN}"
-echo -e "${YELLOW}====================${PLAIN}"
-read -p "确认无误？按回车键继续，按 Ctrl+C 退出..." < /dev/tty
-
-# 2. 检查与安装系统依赖
-echo -e "\n${BLUE}[1/5] 检查系统依赖...${PLAIN}"
-
-# 检测包管理器
-if command -v apt-get >/dev/null 2>&1; then
-    PM="apt"
-elif command -v yum >/dev/null 2>&1; then
-    PM="yum"
-else
-    echo -e "${RED}未找到支持的包管理器 (apt/yum)。请手动安装 git 和 golang。${PLAIN}"
-    exit 1
-fi
-
-# 检查 git
-if ! command -v git >/dev/null 2>&1; then
-    echo -e "${YELLOW}未检测到 git，正在为您安装...${PLAIN}"
-    if [ "$PM" = "apt" ]; then
-        apt-get update && apt-get install -y git
+fail() { printf 'Error: %s\n' "$*" >&2; return 1; }
+usage() {
+    cat <<'USAGE'
+Usage: sudo bash install.sh [--yes] [options]
+  --install-dir PATH     Installation directory (default /opt/acbridge)
+  --ref REF              Build this Git tag/branch/commit; resolved commit is recorded
+  --version VERSION      Install a published release with SHA256 verification
+  --port PORT            Listener port (default 9443)
+  --bind ADDRESS         Listener IP (default 127.0.0.1)
+  --caddy URL            Caddy Admin URL (default http://127.0.0.1:2019)
+  --cert-dir PATH        Certificate cache (default /var/lib/acbridge/certs)
+  --sync-interval N      Synchronization seconds (default 30)
+  --mode proxy|tls       Loopback HTTP behind HTTPS proxy, or supplied TLS certificate
+  --tls-cert PATH --tls-key PATH --tls-server-name NAME
+  --tls-ca PATH          Optional private CA bundle for TLS readiness verification
+  --token-file PATH      Read a token from a protected file (never a command argument)
+  --rotate-token         Explicitly generate a new token
+  --yes                 Noninteractive installation using saved/default settings
+Existing configuration and token are retained unless explicitly overridden.
+USAGE
+}
+defaults() {
+    INSTALL_DIR=/opt/acbridge SERVICE_FILE=/etc/systemd/system/acbridge.service
+    PORT=9443 BIND=127.0.0.1 CADDY_URL=http://127.0.0.1:2019
+    CERT_DIR=/var/lib/acbridge/certs SYNC_INTERVAL=30 MODE=proxy
+    TLS_CERT='' TLS_KEY='' TLS_SERVER_NAME='' TLS_CA='' REF=main VERSION='' TOKEN_FILE=''
+    ROTATE=0 YES=0 LEGACY_TRANSPORT=0 MODE_EXPLICIT=0 BIND_EXPLICIT=0 TXN=0 SUCCESS=0 WAS_ACTIVE=0 WAS_ENABLED=0 BACKUP='' TMP=''
+}
+# Only known keys are loaded; shell text is never sourced or evaluated.
+load_existing() {
+    local key value legacy_data
+    if [[ -f "$INSTALL_DIR/install.conf" ]]; then
+        while IFS='=' read -r key value; do
+            case "$key" in
+                PORT|BIND|CADDY_URL|CERT_DIR|SYNC_INTERVAL|MODE|TLS_CERT|TLS_KEY|TLS_SERVER_NAME|TLS_CA|REF|VERSION) printf -v "$key" '%s' "$value" ;;
+                ''|'#'*) ;;
+                *) fail "Unknown key in install.conf: $key"; return 1 ;;
+            esac
+        done < "$INSTALL_DIR/install.conf"
+    elif [[ -f "$SERVICE_FILE" ]]; then
+        LEGACY_TRANSPORT=1
+        # Migrate the original unit's simple arguments, without executing any text.
+        legacy_data=$(python3 - "$SERVICE_FILE" <<'PYUNIT'
+import shlex,sys
+for line in open(sys.argv[1]):
+    if not line.startswith('ExecStart='): continue
+    args=shlex.split(line.split('=',1)[1]); mapping={'-caddy':'CADDY_URL','-cert-dir':'CERT_DIR','-sync-interval':'SYNC_INTERVAL'}
+    for i,arg in enumerate(args[:-1]):
+        if arg in mapping: print(mapping[arg]+'='+args[i+1])
+        if arg=='-addr':
+            host,port=args[i+1].rsplit(':',1)
+            print('PORT='+port)
+            print('BIND='+(host or '0.0.0.0'))
+PYUNIT
+)
+        while IFS='=' read -r key value; do
+            case "$key" in
+                PORT|BIND|CADDY_URL|CERT_DIR|SYNC_INTERVAL) printf -v "$key" '%s' "$value" ;;
+            esac
+        done <<< "$legacy_data"
+    fi
+}
+parse_args() {
+    while (($#)); do
+        case "$1" in
+            --yes) YES=1; shift ;;
+            --rotate-token) ROTATE=1; shift ;;
+            --help|-h) usage; exit 0 ;;
+            --install-dir|--port|--bind|--caddy|--cert-dir|--sync-interval|--mode|--tls-cert|--tls-key|--tls-server-name|--tls-ca|--ref|--version|--token-file)
+                (($# >= 2)) || { fail "Missing value for $1"; return 1; }
+                case "$1" in
+                    --install-dir) INSTALL_DIR=$2 ;; --port) PORT=$2 ;; --bind) BIND=$2; BIND_EXPLICIT=1 ;;
+                    --caddy) CADDY_URL=$2 ;; --cert-dir) CERT_DIR=$2 ;; --sync-interval) SYNC_INTERVAL=$2 ;;
+                    --mode) MODE=$2; MODE_EXPLICIT=1 ;; --tls-cert) TLS_CERT=$2 ;; --tls-key) TLS_KEY=$2 ;;
+                    --tls-server-name) TLS_SERVER_NAME=$2 ;; --tls-ca) TLS_CA=$2 ;; --ref) REF=$2; VERSION='' ;;
+                    --version) VERSION=$2 ;; --token-file) TOKEN_FILE=$2 ;;
+                esac
+                shift 2 ;;
+            *) fail "Unknown option: $1"; return 1 ;;
+        esac
+    done
+}
+prompt_settings() {
+    local answer
+    [[ $YES == 1 ]] && return 0
+    [[ -r /dev/tty ]] || { fail 'No terminal; use --yes and explicit options'; return 1; }
+    if [[ $LEGACY_TRANSPORT == 1 && $MODE_EXPLICIT == 0 ]]; then
+        printf 'Legacy HTTPS service detected. Choose proxy (requires a new trusted HTTPS frontend) or tls (requires certificate options). Existing AllinSSL URL may need updating.\n'
+        read -r -p 'Explicit transport choice [proxy/tls]: ' answer < /dev/tty
+        MODE=$answer; MODE_EXPLICIT=1
+    fi
+    read -r -p "Listener port [$PORT]: " answer < /dev/tty; PORT=${answer:-$PORT}
+    read -r -p "Caddy Admin URL [$CADDY_URL]: " answer < /dev/tty; CADDY_URL=${answer:-$CADDY_URL}
+    read -r -p "Synchronization seconds [$SYNC_INTERVAL]: " answer < /dev/tty; SYNC_INTERVAL=${answer:-$SYNC_INTERVAL}
+    printf 'Mode: %s. Existing token is retained; use --rotate-token to change it.\n' "$MODE"
+    read -r -p 'Continue installation? [y/N]: ' answer < /dev/tty
+    [[ $answer == y || $answer == Y ]] || { fail 'Installation cancelled'; return 1; }
+}
+validate() {
+    if [[ $LEGACY_TRANSPORT == 1 ]]; then
+        [[ $MODE_EXPLICIT == 1 ]] || { fail 'Legacy HTTPS upgrade requires explicit --mode proxy or --mode tls. Proxy mode requires a trusted HTTPS frontend and updating the AllinSSL URL.'; return 1; }
+        if [[ $MODE == proxy && $BIND_EXPLICIT == 0 ]]; then BIND=127.0.0.1; fi
+    fi
+    [[ $BIND != localhost ]] || BIND=127.0.0.1
+    [[ $INSTALL_DIR =~ ^/[a-zA-Z0-9_./-]+$ && $INSTALL_DIR != / && ! $INSTALL_DIR =~ (^|/)\.\.(/|$) ]] || { fail 'Unsafe installation directory'; return 1; }
+    [[ $CERT_DIR =~ ^/[a-zA-Z0-9_./-]+$ && $CERT_DIR != / && ! $CERT_DIR =~ (^|/)\.\.(/|$) ]] || { fail 'Unsafe certificate directory'; return 1; }
+    [[ $PORT =~ ^[0-9]{1,5}$ ]] && ((10#$PORT >= 1024 && 10#$PORT <= 65535)) || { fail 'Port must be 1024..65535'; return 1; }
+    [[ $SYNC_INTERVAL =~ ^[0-9]{1,6}$ ]] && ((10#$SYNC_INTERVAL >= 1 && 10#$SYNC_INTERVAL <= 86400)) || { fail 'Sync interval must be 1..86400'; return 1; }
+    [[ $BIND =~ ^[0-9.]+$ || $BIND == localhost ]] || { fail 'Bind must be an IPv4 address or localhost'; return 1; }
+    [[ $MODE == proxy || $MODE == tls ]] || { fail 'Mode must be proxy or tls'; return 1; }
+    if [[ $MODE == proxy ]]; then
+        [[ $BIND == 127.0.0.1 || $BIND == localhost ]] || { fail 'Proxy HTTP mode requires loopback binding'; return 1; }
     else
-        yum install -y git
+        [[ -r $TLS_CERT && -r $TLS_KEY && $TLS_SERVER_NAME =~ ^[a-zA-Z0-9.-]+$ ]] || { fail 'TLS mode needs readable --tls-cert/--tls-key and --tls-server-name'; return 1; }
     fi
-fi
-
-# 检查 golang
-if ! command -v go >/dev/null 2>&1; then
-    echo -e "${YELLOW}未检测到 Go 语言环境，正在为您安装最新版...${PLAIN}"
-    if [ "$PM" = "apt" ]; then
-        apt-get update && apt-get install -y golang-go
+    [[ -z $TLS_CA || -r $TLS_CA ]] || { fail 'Cannot read TLS CA bundle'; return 1; }
+    PORT=$((10#$PORT)); SYNC_INTERVAL=$((10#$SYNC_INTERVAL))
+    [[ $REF =~ ^[a-zA-Z0-9_./-]+$ && $REF != -* ]] || { fail 'Invalid Git ref'; return 1; }
+    [[ -z $VERSION || $VERSION =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.-]+)?$ ]] || { fail 'Release version must be vMAJOR.MINOR.PATCH'; return 1; }
+    [[ ! ($ROTATE == 1 && -n $TOKEN_FILE) ]] || { fail 'Use either --rotate-token or --token-file'; return 1; }
+    python3 - "$CADDY_URL" "$BIND" "$INSTALL_DIR" "$CERT_DIR" <<'PY'
+import ipaddress,pathlib,sys,urllib.parse
+u=urllib.parse.urlsplit(sys.argv[1])
+if u.scheme not in ('http','https') or not u.hostname or u.username or u.password or u.query or u.fragment or any(c.isspace() for c in sys.argv[1]) or any(c in sys.argv[1] for c in '"\\%$'): raise SystemExit('Invalid Caddy URL; credentials in URL are unsupported')
+if sys.argv[2]!='localhost': ipaddress.IPv4Address(sys.argv[2])
+install_dir,cache_dir=map(pathlib.Path,sys.argv[3:5])
+reserved={'/','/etc','/usr','/usr/local','/var','/var/lib','/var/cache','/var/log','/tmp','/opt','/home','/root','/run','/srv','/boot','/dev','/proc','/sys','/workspace'}
+for p in (install_dir,cache_dir):
+    if str(p.resolve()) in reserved or p.is_symlink(): raise SystemExit('Use a dedicated directory, not a system directory or symlink')
+if cache_dir.resolve() in (install_dir.resolve(),*install_dir.resolve().parents): raise SystemExit('Certificate cache must be separate from installation directory')
+if cache_dir.exists():
+    for p in cache_dir.iterdir():
+        if p.is_symlink() or not p.is_file() or not (p.name=='.acbridge-cache.json' or p.name.startswith('.cache-') or p.suffix in ('.pem','.crt','.key')):
+            raise SystemExit('Existing certificate directory contains unrelated entries; choose a dedicated cache directory')
+PY
+}
+preflight() {
+    [[ $EUID == 0 ]] || { fail 'Run this installer as root'; return 1; }
+    local cmd
+    for cmd in curl python3 systemctl install useradd getent; do command -v "$cmd" >/dev/null || { fail "Required command missing: $cmd"; return 1; }; done
+    [[ -d /run/systemd/system ]] || { fail 'A running systemd host is required'; return 1; }
+    curl --fail --silent --show-error --max-time 10 "${CADDY_URL%/}/config/" -o "$TMP/caddy.json"
+    python3 - "$TMP/caddy.json" <<'PY'
+import json,sys
+v=json.load(open(sys.argv[1]))
+if v is not None and not isinstance(v,dict): raise SystemExit('Caddy /config/ must return an object')
+PY
+}
+prepare_binary() {
+    if [[ -n $VERSION ]]; then
+        local arch archive url
+        case $(uname -m) in x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) fail 'Unsupported release architecture'; return 1 ;; esac
+        archive="acbridge_linux_${arch}.tar.gz"
+        url="https://github.com/arthurxbwang/acbridge/releases/download/$VERSION"
+        curl --fail --silent --show-error --location "$url/$archive" -o "$TMP/$archive"
+        curl --fail --silent --show-error --location "$url/SHA256SUMS" -o "$TMP/SHA256SUMS"
+        (cd "$TMP"; python3 - "$archive" <<'PY'
+import hashlib,pathlib,sys
+name=sys.argv[1]
+lines=[line.split() for line in pathlib.Path('SHA256SUMS').read_text().splitlines()]
+expected=[x[0] for x in lines if len(x)==2 and x[1].lstrip('*')==name]
+if len(expected)!=1 or hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest()!=expected[0]: raise SystemExit('Release checksum verification failed')
+PY
+        tar -xzf "$archive" acbridge)
+        chmod 0755 "$TMP/acbridge"
     else
-        yum install -y golang
+        command -v git >/dev/null || { fail 'Install git, or select a published --version'; return 1; }
+        command -v go >/dev/null || { fail 'Install Go >=1.20, or select a published --version'; return 1; }
+        local go_version
+        go_version=$(go version)
+        [[ $go_version =~ go1\.([0-9]+) ]] && ((${BASH_REMATCH[1]} >= 20)) || { fail 'Go >=1.20 is required'; return 1; }
+        git init --quiet "$TMP/source"
+        git -C "$TMP/source" remote add origin https://github.com/arthurxbwang/acbridge.git
+        git -C "$TMP/source" fetch --quiet --depth=1 origin "$REF"
+        git -C "$TMP/source" checkout --quiet --detach FETCH_HEAD
+        REF=$(git -C "$TMP/source" rev-parse HEAD)
+        (cd "$TMP/source"; CGO_ENABLED=0 go build -mod=readonly -trimpath -ldflags "-s -w -X main.version=source -X main.commit=$REF" -o "$TMP/acbridge" .)
     fi
-    # 再次检查
-    if ! command -v go >/dev/null 2>&1; then
-        echo -e "${RED}错误：Go 语言环境安装失败，请手动安装后重试。${PLAIN}"
-        exit 1
+    "$TMP/acbridge" -version >/dev/null
+}
+prepare_token() {
+    if [[ -n $TOKEN_FILE ]]; then
+        [[ -f $TOKEN_FILE && -r $TOKEN_FILE ]] || { fail 'Cannot read token file'; return 1; }
+        TOKEN=$(cat "$TOKEN_FILE")
+    elif [[ $ROTATE == 0 && -f "$INSTALL_DIR/acbridge.env" ]]; then
+        TOKEN=$(python3 - "$INSTALL_DIR/acbridge.env" <<'PY'
+import shlex,sys
+values=[]
+for line in open(sys.argv[1]):
+    if line.startswith('ACBRIDGE_TOKEN='):
+        fields=shlex.split(line.rstrip('\n').split('=',1)[1], comments=False)
+        if len(fields)!=1: raise SystemExit('Cannot safely read existing token')
+        values.append(fields[0])
+if len(values)!=1: raise SystemExit('Expected exactly one existing ACBRIDGE_TOKEN')
+sys.stdout.write(values[0])
+PY
+)
+    elif [[ $ROTATE == 0 && -f "$SERVICE_FILE" ]]; then
+        TOKEN=$(python3 - "$SERVICE_FILE" <<'PYTOKEN'
+import secrets,shlex,sys
+values=[]
+for line in open(sys.argv[1]):
+    if not line.startswith('ExecStart='): continue
+    args=shlex.split(line.split('=',1)[1])
+    for i,arg in enumerate(args[:-1]):
+        if arg=='-token': values.append(args[i+1])
+if len(values)>1: raise SystemExit('Ambiguous legacy token; supply --token-file')
+sys.stdout.write(values[0] if values else secrets.token_hex(32))
+PYTOKEN
+)
+    else
+        TOKEN=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
     fi
-fi
-
-echo -e "Go 编译器版本: ${GREEN}$(go version)${PLAIN}"
-
-# 3. 拉取最新的代码并编译
-echo -e "\n${BLUE}[2/5] 从 GitHub 拉取代码并编译...${PLAIN}"
-
-BUILD_DIR="/tmp/acbridge_build"
-rm -rf "$BUILD_DIR"
-mkdir -p "$BUILD_DIR"
-
-# 优先通过 HTTPS 克隆
-REPO_URL="https://github.com/arthurxbwang/acbridge.git"
-echo -e "克隆仓库: ${REPO_URL}"
-git clone --depth=1 "$REPO_URL" "$BUILD_DIR"
-
-if [ $? -ne 0 ]; then
-    echo -e "${RED}错误：代码克隆失败，请检查网络连接是否可访问 GitHub。${PLAIN}"
-    rm -rf "$BUILD_DIR"
-    exit 1
-fi
-
-# 编译
-cd "$BUILD_DIR" || exit 1
-echo -e "开始编译 Go 二进制程序..."
-CGO_ENABLED=0 go build -ldflags="-s -w" -o acbridge
-
-if [ $? -ne 0 ]; then
-    echo -e "${RED}错误：代码编译失败。${PLAIN}"
-    rm -rf "$BUILD_DIR"
-    exit 1
-fi
-
-# 4. 安装文件到目标位置
-echo -e "\n${BLUE}[3/5] 安装程序到目标路径...${PLAIN}"
-
-# 创建目标目录
-mkdir -p "$INSTALL_DIR"
-mkdir -p "/var/lib/acbridge/certs"
-
-# 复制编译好的二进制文件
-mv "$BUILD_DIR/acbridge" "$INSTALL_DIR/acbridge"
-chmod +x "$INSTALL_DIR/acbridge"
-
-# 清理临时编译目录
-rm -rf "$BUILD_DIR"
-
-echo -e "二进制已成功安装至: ${GREEN}$INSTALL_DIR/acbridge${PLAIN}"
-
-# 5. 配置 Systemd 服务
-echo -e "\n${BLUE}[4/5] 配置 Systemd 服务...${PLAIN}"
-
-SERVICE_FILE="/etc/systemd/system/acbridge.service"
-# Keep credentials out of argv, service status and installer output.
-TOKEN_ESCAPED=${TOKEN//\\/\\\\}
-TOKEN_ESCAPED=${TOKEN_ESCAPED//\"/\\\"}
-(umask 077; printf 'ACBRIDGE_TOKEN="%s"\n' "$TOKEN_ESCAPED" > "$INSTALL_DIR/acbridge.env")
-chmod 600 "$INSTALL_DIR/acbridge.env"
-
-cat > "$SERVICE_FILE" <<EOF
+    [[ -n $TOKEN && ${#TOKEN} -le 512 && $TOKEN != *$'\n'* && $TOKEN != *$'\r'* && $TOKEN != 'acbridge-secret-token' ]] || { fail 'Token is empty, invalid, or the insecure legacy default; use --rotate-token'; return 1; }
+}
+setup_account() {
+    getent passwd acbridge >/dev/null || useradd --system --home-dir /var/lib/acbridge --shell /usr/sbin/nologin acbridge
+    install -d -o acbridge -g acbridge -m 0700 "$CERT_DIR"
+    # Existing certificate files must remain usable after migration from root.
+    local cached_file
+    while IFS= read -r -d '' cached_file; do chown acbridge:acbridge "$cached_file"; done < <(find "$CERT_DIR" -maxdepth 1 -type f -print0)
+}
+render_unit() {
+    local transport='-http'
+    [[ $MODE == tls ]] && transport="-tls-cert $INSTALL_DIR/tls/cert.pem -tls-key $INSTALL_DIR/tls/key.pem"
+    cat <<UNIT
 [Unit]
-Description=acbridge - AllinSSL to Caddy SSL Bridge
-After=network.target caddy.service
-Wants=caddy.service
-
+Description=acbridge - AllinSSL to Caddy certificate bridge
+After=network-online.target
+Wants=network-online.target
 [Service]
 Type=simple
-User=root
+User=acbridge
+Group=acbridge
 WorkingDirectory=$INSTALL_DIR
 EnvironmentFile=$INSTALL_DIR/acbridge.env
-ExecStart=$INSTALL_DIR/acbridge -addr :$PORT -caddy $CADDY_URL -cert-dir /var/lib/acbridge/certs -sync-interval $SYNC_INTERVAL
-Restart=always
+ExecStart=$INSTALL_DIR/acbridge -addr $BIND:$PORT -caddy $CADDY_URL -cert-dir $CERT_DIR -sync-interval $SYNC_INTERVAL $transport
+Restart=on-failure
 RestartSec=5
-
-# 安全限制
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_BIND_SERVICE
+UMask=0077
 NoNewPrivileges=true
-
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=$CERT_DIR
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
 [Install]
 WantedBy=multi-user.target
-EOF
-
-# 6. 启动服务并设置自启
-echo -e "\n${BLUE}[5/5] 启动服务并启用开机自启...${PLAIN}"
-systemctl daemon-reload
-systemctl enable acbridge
-systemctl restart acbridge
-
-# 确认服务运行状态
-sleep 2
-if systemctl is-active --quiet acbridge; then
-    echo -e "\n${GREEN}==================================================${PLAIN}"
-    echo -e "${GREEN}🎉 acbridge 安装及启动成功！${PLAIN}"
-    echo -e "=================================================="
-    echo -e "1. 接口地址   : ${BLUE}https://<服务器IP>:$PORT${PLAIN}"
-    echo -e "2. 验证 Token : 已保存于安装目录的 acbridge.env（权限 0600，不显示）"
-    echo -e "3. 证书备份目录: ${BLUE}/var/lib/acbridge/certs${PLAIN}"
-    echo -e "4. Caddy API  : ${BLUE}$CADDY_URL${PLAIN}"
-    echo -e "5. 运行状态   : ${GREEN}运行中 (Active)${PLAIN}"
-    echo -e "--------------------------------------------------"
-    echo -e "【AllinSSL 配置提示】"
-    echo -e "请在 AllinSSL 的“授权 API”中添加 “雷池 (SafeLine)” WAF 实例："
-    echo -e "  - 访问地址: https://<服务器IP>:$PORT"
-    echo -e "  - API Token: 使用安装时配置的值；随机生成的值保存在 acbridge.env，请安全读取"
-    echo -e "--------------------------------------------------"
-    echo -e "【管理命令】"
-    echo -e "  - 查看服务状态: ${YELLOW}systemctl status acbridge${PLAIN}"
-    echo -e "  - 查看实时日志: ${YELLOW}journalctl -u acbridge -f${PLAIN}"
-    echo -e "  - 重启服务    : ${YELLOW}systemctl restart acbridge${PLAIN}"
-    echo -e "${GREEN}==================================================${PLAIN}"
-else
-    echo -e "\n${RED}⚠️ 警告：acbridge 服务已安装但未能正常启动。${PLAIN}"
-    echo -e "请运行 ${YELLOW}journalctl -u acbridge -n 50 --no-pager${PLAIN} 查看错误日志。"
-fi
+UNIT
+}
+write_config() {
+    local key
+    for key in PORT BIND CADDY_URL CERT_DIR SYNC_INTERVAL MODE TLS_CERT TLS_KEY TLS_SERVER_NAME TLS_CA REF VERSION; do printf '%s=%s\n' "$key" "${!key}"; done
+}
+wait_ready() {
+    local url="http://127.0.0.1:$PORT/readyz" i connect_host=$BIND
+    [[ $connect_host != 0.0.0.0 ]] || connect_host=127.0.0.1
+    local -a tls_args=()
+    if [[ $MODE == tls ]]; then
+        url="https://$TLS_SERVER_NAME:$PORT/readyz"
+        tls_args=(--resolve "$TLS_SERVER_NAME:$PORT:$connect_host")
+        [[ -z $TLS_CA ]] || tls_args+=(--cacert "$TLS_CA")
+    fi
+    # Token travels through a 0600 curl config, never argv or terminal output.
+    printf '%s' "$TOKEN" | python3 -c 'import sys; s=sys.stdin.read(); print("header = \"X-SLCE-API-TOKEN: "+s.replace("\\","\\\\").replace("\"","\\\"")+"\"")' > "$TMP/curl.conf"
+    for ((i=0;i<30;i++)); do
+        if curl --config "$TMP/curl.conf" --fail --silent --max-time 2 "${tls_args[@]}" "$url" > "$TMP/ready.json" && python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("data", {}).get("ready") is True else 1)' "$TMP/ready.json"; then return 0; fi
+        sleep 1
+    done
+    fail 'Readiness failed: bridge did not confirm successful Caddy synchronization'
+}
+restore_file() {
+    local name=$1 target=$2
+    if [[ -e "$BACKUP/$name" ]]; then cp -a "$BACKUP/$name" "$target.rollback"; mv -f "$target.rollback" "$target"; else rm -f "$target"; fi
+}
+rollback() {
+    printf 'Installation failed; restoring previous binary, configuration and unit.\n' >&2
+    systemctl stop acbridge >/dev/null 2>&1 || true
+    restore_file acbridge "$INSTALL_DIR/acbridge"
+    restore_file acbridge.env "$INSTALL_DIR/acbridge.env"
+    restore_file install.conf "$INSTALL_DIR/install.conf"
+    restore_file service "$SERVICE_FILE"
+    if [[ -d "$BACKUP/tls" ]]; then rm -rf "$INSTALL_DIR/tls"; cp -a "$BACKUP/tls" "$INSTALL_DIR/tls"; else rm -rf "$INSTALL_DIR/tls"; fi
+    systemctl daemon-reload || true
+    if [[ $WAS_ENABLED == 1 ]]; then systemctl enable acbridge >/dev/null 2>&1 || true; else systemctl disable acbridge >/dev/null 2>&1 || true; fi
+    if [[ $WAS_ACTIVE == 1 ]]; then systemctl restart acbridge || printf 'Previous service also failed to restart; inspect journalctl -u acbridge.\n' >&2; fi
+}
+cleanup() {
+    local rc=$?
+    trap - EXIT
+    if [[ $TXN == 1 && $SUCCESS != 1 ]]; then rollback || true; rc=1; fi
+    [[ -z $TMP ]] || rm -rf "$TMP"
+    exit "$rc"
+}
+perform_install() {
+    install -d -m 0755 "$INSTALL_DIR"
+    BACKUP=$(mktemp -d "$INSTALL_DIR/.backup.XXXXXX")
+    local file
+    for file in acbridge acbridge.env install.conf; do [[ ! -e "$INSTALL_DIR/$file" ]] || cp -a "$INSTALL_DIR/$file" "$BACKUP/$file"; done
+    [[ ! -f $SERVICE_FILE ]] || cp -a "$SERVICE_FILE" "$BACKUP/service"
+    [[ ! -d "$INSTALL_DIR/tls" ]] || cp -a "$INSTALL_DIR/tls" "$BACKUP/tls"
+    systemctl is-active --quiet acbridge && WAS_ACTIVE=1
+    systemctl is-enabled --quiet acbridge && WAS_ENABLED=1
+    TXN=1
+    setup_account
+    if [[ $MODE == tls ]]; then
+        install -d -o root -g acbridge -m 0750 "$INSTALL_DIR/tls"
+        install -o root -g acbridge -m 0640 "$TLS_CERT" "$TMP/cert.pem"
+        install -o root -g acbridge -m 0640 "$TLS_KEY" "$TMP/key.pem"
+        cp -p "$TMP/cert.pem" "$INSTALL_DIR/tls/cert.pem.new"; mv -f "$INSTALL_DIR/tls/cert.pem.new" "$INSTALL_DIR/tls/cert.pem"
+        cp -p "$TMP/key.pem" "$INSTALL_DIR/tls/key.pem.new"; mv -f "$INSTALL_DIR/tls/key.pem.new" "$INSTALL_DIR/tls/key.pem"
+        TLS_CERT=$INSTALL_DIR/tls/cert.pem TLS_KEY=$INSTALL_DIR/tls/key.pem
+    fi
+    install -m 0755 "$TMP/acbridge" "$INSTALL_DIR/acbridge.new"
+    mv -f "$INSTALL_DIR/acbridge.new" "$INSTALL_DIR/acbridge"
+    local escaped=${TOKEN//\\/\\\\}; escaped=${escaped//\"/\\\"}
+    printf 'ACBRIDGE_TOKEN="%s"\n' "$escaped" > "$INSTALL_DIR/acbridge.env.new"
+    chmod 0600 "$INSTALL_DIR/acbridge.env.new"; mv -f "$INSTALL_DIR/acbridge.env.new" "$INSTALL_DIR/acbridge.env"
+    write_config > "$INSTALL_DIR/install.conf.new"; mv -f "$INSTALL_DIR/install.conf.new" "$INSTALL_DIR/install.conf"
+    render_unit > "$SERVICE_FILE.new"; chmod 0644 "$SERVICE_FILE.new"; mv -f "$SERVICE_FILE.new" "$SERVICE_FILE"
+    systemctl daemon-reload
+    systemctl restart acbridge
+    wait_ready
+    systemctl enable acbridge
+    SUCCESS=1
+    printf 'acbridge installed and Caddy synchronization verified. Backup: %s\n' "$BACKUP"
+    printf 'Token retained/generated in %s/acbridge.env (0600); value is not displayed.\n' "$INSTALL_DIR"
+    if [[ $MODE == proxy ]]; then
+        printf '\nHTTPS frontend still needs configuration before AllinSSL can connect. Add a dedicated hostname to your Caddyfile:\n\nbridge.example.com {\n    reverse_proxy 127.0.0.1:%s\n}\n\n' "$PORT"
+        printf 'Use your real hostname, configure DNS, validate/reload Caddy, then use that HTTPS URL in AllinSSL → 雷池 WAF 面板.\n'
+    else
+        printf 'AllinSSL HTTPS URL: https://%s:%s (ensure DNS/network access).\n' "$TLS_SERVER_NAME" "$PORT"
+    fi
+}
+main() {
+    defaults
+    command -v python3 >/dev/null || { fail 'python3 is required for safe configuration handling'; return 1; }
+    local -a args=("$@")
+    local explicit_dir=0 i
+    for ((i=0;i<${#args[@]};i++)); do
+        if [[ ${args[i]} == --help || ${args[i]} == -h ]]; then usage; return; fi
+        if [[ ${args[i]} == --install-dir ]]; then INSTALL_DIR=${args[i+1]:-}; explicit_dir=1; fi
+    done
+    # Find the previous custom installation directory from a literal unit directive.
+    if [[ $explicit_dir == 0 && -f $SERVICE_FILE ]]; then
+        local line
+        while IFS= read -r line; do [[ $line != WorkingDirectory=* ]] || INSTALL_DIR=${line#WorkingDirectory=}; done < "$SERVICE_FILE"
+    fi
+    load_existing
+    parse_args "$@"
+    prompt_settings
+    validate
+    TMP=$(mktemp -d /tmp/acbridge-install.XXXXXX)
+    trap cleanup EXIT
+    preflight
+    prepare_binary
+    prepare_token
+    perform_install
+}
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi

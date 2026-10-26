@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.20.x', 'stable']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false # This module has no third-party dependencies or go.sum.
+      - name: Install verified Caddy integration dependency
+        shell: bash
+        env:
+          # Official caddy_2.10.2_checksums.txt uses SHA-512.
+          CADDY_SHA512: 747df7ee74de188485157a383633a1a963fd9233b71fbb4a69ddcbcc589ce4e2cc82dacf5dbbe136cb51d17e14c59daeb5d9bc92487610b0f3b93680b2646546
+        run: |
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/caddyserver/caddy/releases/download/v2.10.2/caddy_2.10.2_linux_amd64.tar.gz \
+            -o "$RUNNER_TEMP/caddy.tar.gz"
+          printf '%s  %s\n' "$CADDY_SHA512" "$RUNNER_TEMP/caddy.tar.gz" | sha512sum --check
+          tar -xzf "$RUNNER_TEMP/caddy.tar.gz" -C "$RUNNER_TEMP" caddy
+          echo "CADDY_BIN=$RUNNER_TEMP/caddy" >> "$GITHUB_ENV"
+      - name: Build and static checks
+        run: |
+          go build -mod=readonly -o "$RUNNER_TEMP/acbridge" .
+          go vet -mod=readonly ./...
+          bash -n install.sh scripts/build-release.sh scripts/test-install.sh
+      - name: Regression and real TLS integration tests
+        shell: bash
+        run: |
+          go test -mod=readonly -race -count=1 -json ./... | tee "$RUNNER_TEMP/test-results.json"
+          python3 - "$RUNNER_TEMP/test-results.json" <<'PY'
+          import json, sys
+          events = [json.loads(line) for line in open(sys.argv[1])]
+          assert any(e.get('Test') == 'TestRealCaddyTLS' and e['Action'] == 'pass' for e in events), 'Real Caddy TLS test did not pass'
+          skipped = [e.get('Test') for e in events if e['Action'] == 'skip']
+          assert not skipped, f'Unexpected skipped tests: {skipped}'
+          PY
+      - name: Installer upgrade and rollback tests
+        run: bash scripts/test-install.sh

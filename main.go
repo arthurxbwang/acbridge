@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -12,9 +14,12 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -65,6 +70,7 @@ type CertNode struct {
 	Revoked       bool     `json:"revoked"`
 	SelfSignature bool     `json:"self_signature"`
 	Trusted       bool     `json:"trusted"`
+	TrustStatus   string   `json:"trust_status"`
 	Type          int      `json:"type"`
 	ValidBefore   string   `json:"valid_before"`
 }
@@ -75,78 +81,61 @@ type CertListData struct {
 }
 
 func main() {
-	flag.StringVar(&addr, "addr", ":9443", "Address to listen on (e.g. :9443 or 0.0.0.0:9443)")
-	flag.StringVar(&token, "token", "acbridge-secret-token", "API Token for authentication (X-SLCE-API-TOKEN header)")
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
+	flag.StringVar(&addr, "addr", "127.0.0.1:9443", "Address to listen on")
+	flag.StringVar(&token, "token", "", "API token (prefer ACBRIDGE_TOKEN to keep credentials out of process arguments)")
 	flag.StringVar(&caddyURL, "caddy", "http://127.0.0.1:2019", "Caddy Admin API base URL")
 	flag.StringVar(&certDir, "cert-dir", "./certs", "Directory to store certificate cache files")
 	var syncSec int
-	flag.IntVar(&syncSec, "sync-interval", 30, "Interval in seconds to sync certificates with Caddy")
+	var options runtimeOptions
+	var printVersion bool
+	flag.IntVar(&syncSec, "sync-interval", 30, "Positive interval in seconds to sync certificates with Caddy")
+	flag.StringVar(&options.CertFile, "tls-cert", "", "HTTPS certificate chain file")
+	flag.StringVar(&options.KeyFile, "tls-key", "", "HTTPS private key file")
+	flag.BoolVar(&options.HTTP, "http", false, "Serve HTTP on loopback only, behind a trusted HTTPS reverse proxy")
+	flag.BoolVar(&options.DevSelfSigned, "dev-self-signed", false, "Explicit development-only ephemeral self-signed HTTPS")
+	flag.BoolVar(&printVersion, "version", false, "Print version and exit")
 	flag.Parse()
-
-	// Override token from environment variable if present
+	if printVersion {
+		fmt.Printf("acbridge %s (%s)\n", version, commit)
+		return nil
+	}
 	if envToken := os.Getenv("ACBRIDGE_TOKEN"); envToken != "" {
 		token = envToken
 	}
-
-	log.Printf("================ acbridge starting ================")
-	log.Printf("Listening on: %s", addr)
-	log.Print("API Token   : configured (value hidden)")
-	log.Printf("Caddy URL   : %s", caddyURL)
-	log.Printf("Cert Cache  : %s", certDir)
-	log.Printf("Sync Every  : %d seconds", syncSec)
-	log.Printf("===================================================")
-
-	if syncSec <= 0 {
-		log.Fatal("sync-interval must be positive")
+	if err := validateRuntimeOptions(addr, token, caddyURL, syncSec, options); err != nil {
+		return err
 	}
 	syncInterval = time.Duration(syncSec) * time.Second
-
-	// 1. Create cert directory
-	if err := os.MkdirAll(certDir, 0755); err != nil {
-		log.Fatalf("Failed to create cert directory: %v", err)
-	}
-
-	// 2. Load cached certs from disk
-	if err := loadCertsFromDisk(); err != nil {
-		log.Fatalf("Cannot safely load certificate cache: %v", err)
-	}
-
-	// 3. Initial sync with Caddy
-	if err := syncWithCaddy(); err != nil {
-		log.Printf("Initial sync with Caddy failed: %v (make sure Caddy is running and admin API is enabled)", err)
-	} else {
-		log.Println("Initial sync with Caddy succeeded!")
-	}
-
-	// 4. Start periodic sync routine
-	go startSyncLoop()
-
-	// Use a dedicated mux so protocol endpoints are testable.
-	mux := newHandler()
-
-	// Generate self-signed cert for HTTPS
-	tlsCert, err := generateSelfSignedCert()
+	server, err := newRuntimeServer(addr, wrapRuntimeHandler(newHandler()), options)
 	if err != nil {
-		log.Fatalf("Failed to generate self-signed cert: %v", err)
+		return err
 	}
-
-	server := &http.Server{
-		Addr:    addr,
-		Handler: mux,
-		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{tlsCert},
-		},
+	if err := os.MkdirAll(certDir, 0700); err != nil {
+		return fmt.Errorf("create certificate cache: %w", err)
 	}
-
-	log.Printf("Listening on (HTTPS): %s", addr)
-	log.Fatal(server.ListenAndServeTLS("", ""))
+	if err := loadCertsFromDisk(); err != nil {
+		return fmt.Errorf("cannot safely load certificate cache: %w", err)
+	}
+	if err := syncWithCaddy(); err != nil {
+		log.Printf("Initial sync failed; /readyz will report unavailable: %v", err)
+	}
+	go startSyncLoop()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return serveRuntime(ctx, server, options.HTTP)
 }
 
 // authMiddleware checks the X-SLCE-API-TOKEN header
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		reqToken := r.Header.Get("X-SLCE-API-TOKEN")
-		if reqToken != token {
+		if token == "" || subtle.ConstantTimeCompare([]byte(reqToken), []byte(token)) != 1 {
 			log.Printf("Unauthorized request from %s: invalid or missing token", r.RemoteAddr)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
@@ -165,15 +154,11 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "acbridge - AllinSSL to Caddy Bridge is running.\n")
-	cacheMutex.RLock()
-	defer cacheMutex.RUnlock()
-	fmt.Fprintf(w, "Cached domains count: %d\n", len(certCache))
-	for domain, cert := range certCache {
-		fmt.Fprintf(w, " - %s (Expires: %s, Issuer: %s)\n", domain, cert.NotAfter.Format(time.RFC3339), cert.Issuer)
+	if !requireMethod(w, r, http.MethodGet) {
+		return
 	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprintln(w, "acbridge is running")
 }
 
 func handleCert(w http.ResponseWriter, r *http.Request) {
@@ -208,6 +193,12 @@ func handleListCerts(w http.ResponseWriter, r *http.Request) {
 		}
 
 		expired := time.Now().After(cert.NotAfter)
+		selfSigned := false
+		if block, _ := pem.Decode([]byte(cert.Certificate)); block != nil {
+			if leaf, err := x509.ParseCertificate(block.Bytes); err == nil {
+				selfSigned = leaf.CheckSignature(leaf.SignatureAlgorithm, leaf.RawTBSCertificate, leaf.Signature) == nil
+			}
+		}
 		node := CertNode{
 			AcmeMessage:   "",
 			Domains:       cert.Domains,
@@ -216,8 +207,9 @@ func handleListCerts(w http.ResponseWriter, r *http.Request) {
 			Issuer:        cert.Issuer,
 			RelatedSites:  cert.Domains, // Map domains as sites
 			Revoked:       false,
-			SelfSignature: false,
-			Trusted:       true,
+			SelfSignature: selfSigned,
+			Trusted:       false,
+			TrustStatus:   "not_verified",
 			Type:          0, // 0 = manual cert usually
 			ValidBefore:   cert.NotAfter.Format("2006-01-02 15:04:05"),
 		}
@@ -259,7 +251,9 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 		Subject: pkix.Name{
 			Organization: []string{"acbridge Mock WAF"},
 		},
-		NotBefore:             notBefore,
+		NotBefore:             notBefore.Add(-time.Minute),
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
 		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},

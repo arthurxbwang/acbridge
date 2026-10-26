@@ -208,8 +208,13 @@ func parsePair(certText, keyText string) (CaddyCert, error) {
 		}
 	}
 	domains := append([]string{}, leaf.DNSNames...)
-	if leaf.Subject.CommonName != "" {
+	// SANs are authoritative. A different legacy CN must not make an unrelated
+	// certificate appear to overlap with another site.
+	if len(domains) == 0 && leaf.Subject.CommonName != "" {
 		domains = append(domains, leaf.Subject.CommonName)
+	}
+	for i, d := range domains {
+		domains[i] = strings.ToLower(strings.TrimSuffix(d, "."))
 	}
 	sort.Strings(domains)
 	unique := domains[:0]
@@ -228,6 +233,52 @@ func parsePair(certText, keyText string) (CaddyCert, error) {
 	c := CaddyCert{Certificate: string(certPEM), Key: string(keyPEM), Domains: unique, NotAfter: leaf.NotAfter, Issuer: issuer, ID: getCertID(string(certPEM))}
 	c.LegacyIDs = []int64{oldCertID(certText), oldCertID(c.Certificate)}
 	return c, nil
+}
+
+// Time validity is checked for new uploads only. Existing caches must remain
+// readable after expiry so the operator can renew or remove their certificates.
+func validateUploadValidity(c CaddyCert, now time.Time) error {
+	rest := []byte(c.Certificate)
+	for index := 0; len(bytes.TrimSpace(rest)) > 0; index++ {
+		block, next := pem.Decode(rest)
+		if block == nil {
+			return fmt.Errorf("invalid certificate PEM")
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return fmt.Errorf("invalid certificate DER")
+		}
+		if now.Before(cert.NotBefore) {
+			return fmt.Errorf("certificate %d in chain is not yet valid", index+1)
+		}
+		if now.After(cert.NotAfter) {
+			return fmt.Errorf("certificate %d in chain has expired", index+1)
+		}
+		rest = next
+	}
+	return nil
+}
+
+// Keep the check conservative for wildcard SANs: their entire scope is
+// preserved only by the same wildcard. Exact names can also be covered by a
+// single-label wildcard, matching TLS hostname verification semantics.
+func coversDomain(names []string, domain string) bool {
+	for _, name := range names {
+		if name == domain {
+			return true
+		}
+		if strings.HasPrefix(domain, "*.") || !strings.HasPrefix(name, "*.") {
+			continue
+		}
+		suffix := name[1:]
+		if strings.HasSuffix(domain, suffix) {
+			prefix := strings.TrimSuffix(domain, suffix)
+			if prefix != "" && !strings.Contains(prefix, ".") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func snapshotCache() map[string]CaddyCert {
@@ -289,6 +340,9 @@ func handleUpsertCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c, err := parsePair(req.Manual.Crt, req.Manual.Key)
+	if err == nil {
+		err = validateUploadValidity(c, time.Now())
+	}
 	if err != nil {
 		reply(w, 400, nil, "invalid_cert", err.Error())
 		return
@@ -327,6 +381,17 @@ func handleUpsertCert(w http.ResponseWriter, r *http.Request) {
 			retired[old.ID] = true
 		}
 	}
+	var uncovered []string
+	for d, old := range next {
+		if retired[old.ID] && !coversDomain(c.Domains, d) {
+			uncovered = append(uncovered, d)
+		}
+	}
+	if len(uncovered) > 0 {
+		sort.Strings(uncovered)
+		reply(w, 409, nil, "coverage_reduction", "Replacement would remove certificate coverage for: "+strings.Join(uncovered, ", ")+"; upload a certificate covering these names or explicitly delete the old certificate first")
+		return
+	}
 	for d, old := range next {
 		if retired[old.ID] {
 			delete(next, d)
@@ -339,6 +404,7 @@ func handleUpsertCert(w http.ResponseWriter, r *http.Request) {
 		reply(w, 500, nil, "cache_failed", "Failed to persist certificate cache")
 		return
 	}
+	markSyncPending()
 	replaceCache(next)
 	// Valid desired state is durable even if Caddy rejects it. Caller gets failure;
 	// the sync loop, binding call or repeated POST retries the same stable ID.
@@ -373,6 +439,7 @@ func handleDeleteCert(w http.ResponseWriter, r *http.Request) {
 		reply(w, 500, nil, "cache_failed", "Failed to persist certificate cache")
 		return
 	}
+	markSyncPending()
 	replaceCache(next)
 	if err := syncWithCaddyLocked(); err != nil {
 		reply(w, 502, nil, "caddy_sync_failed", err.Error())
@@ -483,7 +550,8 @@ func syncWithCaddy() error {
 	return syncWithCaddyLocked()
 }
 
-func syncWithCaddyLocked() error {
+func syncWithCaddyLocked() (err error) {
+	defer func() { recordSyncResult(err) }()
 	desired := []CaddyLoadPemItem{}
 	for _, c := range uniqueCerts(snapshotCache()) {
 		desired = append(desired, CaddyLoadPemItem{Certificate: c.Certificate, Key: c.Key, Tags: []string{managedTag}})

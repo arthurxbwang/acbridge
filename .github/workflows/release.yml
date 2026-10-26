@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]*']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 'stable'
+          cache: false
+      - name: Build versioned Linux artifacts
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: bash scripts/build-release.sh "$RELEASE_VERSION" "$RUNNER_TEMP/release"
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_VERSION" --verify-tag --generate-notes \
+            "$RUNNER_TEMP/release/acbridge_linux_amd64.tar.gz" \
+            "$RUNNER_TEMP/release/acbridge_linux_arm64.tar.gz" \
+            "$RUNNER_TEMP/release/SHA256SUMS"

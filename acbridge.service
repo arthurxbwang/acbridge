@@ -1,21 +1,23 @@
 [Unit]
-Description=acbridge - AllinSSL to Caddy SSL Bridge
-After=network.target caddy.service
-Wants=caddy.service
-
+Description=acbridge - AllinSSL to Caddy certificate bridge
+After=network-online.target
+Wants=network-online.target
 [Service]
 Type=simple
-User=root
+User=acbridge
+Group=acbridge
 WorkingDirectory=/opt/acbridge
 EnvironmentFile=/opt/acbridge/acbridge.env
-ExecStart=/opt/acbridge/acbridge -addr :9443 -caddy http://127.0.0.1:2019 -cert-dir /var/lib/acbridge/certs -sync-interval 30
-Restart=always
+ExecStart=/opt/acbridge/acbridge -addr 127.0.0.1:9443 -caddy http://127.0.0.1:2019 -cert-dir /var/lib/acbridge/certs -sync-interval 30 -http
+Restart=on-failure
 RestartSec=5
-
-# Security hardening
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_BIND_SERVICE
+UMask=0077
 NoNewPrivileges=true
-
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/acbridge/certs
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
 [Install]
 WantedBy=multi-user.target
